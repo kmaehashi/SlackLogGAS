@@ -94,9 +94,7 @@ var SlackAccessor = (function() {
       qparams.push(encodeURIComponent(k) + "=" + encodeURIComponent(params[k]));
     }
     url += qparams.join('&');
-    
-    console.log("==> GET " + url);
-    
+
     var response = UrlFetchApp.fetch(url);
     var data = JSON.parse(response.getContentText());
     if (data.error) {
