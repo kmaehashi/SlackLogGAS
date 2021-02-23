@@ -1,3 +1,5 @@
+// Modified based on https://github.com/negimochi/SlackLogGAS/blob/master/SlackLog.gs
+
 var API_TOKEN = PropertiesService.getScriptProperties().getProperty('slack_api_token');
 if (!API_TOKEN) {
     throw 'You should set "slack_api_token" property from [File] > [Project properties] > [Script properties]';
