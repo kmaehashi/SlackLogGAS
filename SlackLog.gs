@@ -117,7 +117,7 @@ var SlackAccessor = (function() {
   
   // チャンネル情報取得
   p.requestChannelInfo = function() {
-    var response = this.requestAPI('channels.list');
+    var response = this.requestAPI('conversations.list');
     response.channels.forEach(function (channel) {
       console.log("channel(id:" + channel.id + ") = " + channel.name);
     });
@@ -139,7 +139,7 @@ var SlackAccessor = (function() {
       if (oldest) {
         options['oldest'] = oldest;
       }
-      var response = _this.requestAPI('channels.history', options);
+      var response = _this.requestAPI('conversations.history', options);
       messages = response.messages.concat(messages);
       return response;
     };
