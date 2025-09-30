@@ -13,6 +13,8 @@ if (typeof(Drive) === 'undefined') {
 }
 var SUBFOLDER_NAME = "SlackLog";
 var SPREADSHEET_NAME = "LogData";
+var THREAD_SEARCH_DAYS = 90;
+var THREAD_CHILD_PREFIX = "| ";
 
 function FindOrCreateFolder(folder, folderName) 
 {
@@ -59,6 +61,81 @@ function DownloadData(url, folder, savefilePrefix)
   return folder.createFile(fileBlob);
 }
 
+function CollectMessagesWithThreads(slackAccessor, channel, baseMessages, lastTimestamp)
+{
+  var lastTsNumber = parseFloat(lastTimestamp);
+  if (isNaN(lastTsNumber)) {
+    lastTsNumber = 0;
+  }
+
+  var newParentMessages = [];
+  var repliesByParent = {};
+  var seenReplyTs = {};
+
+  baseMessages.forEach(function (msg) {
+    if (!msg || !msg.ts) {
+      return;
+    }
+
+    var msgTsNumber = parseFloat(msg.ts);
+    if (isNaN(msgTsNumber)) {
+      msgTsNumber = 0;
+    }
+
+    var isThreadParent = msg.thread_ts && msg.thread_ts === msg.ts;
+
+    if (msgTsNumber > lastTsNumber && (!msg.thread_ts || msg.thread_ts === msg.ts)) {
+      newParentMessages.push(msg);
+    }
+
+    if (isThreadParent && msg.reply_count && msg.reply_count > 0) {
+      var threadMessages = slackAccessor.requestThreadMessages(channel, msg.thread_ts);
+      if (!repliesByParent[msg.thread_ts]) {
+        repliesByParent[msg.thread_ts] = [];
+      }
+      threadMessages.forEach(function (threadMessage) {
+        if (!threadMessage || !threadMessage.ts) {
+          return;
+        }
+        if (threadMessage.ts === msg.ts) {
+          return;
+        }
+        if (seenReplyTs[threadMessage.ts]) {
+          return;
+        }
+        var threadTsNumber = parseFloat(threadMessage.ts);
+        if (isNaN(threadTsNumber)) {
+          threadTsNumber = 0;
+        }
+        if (threadTsNumber <= lastTsNumber) {
+          return;
+        }
+        repliesByParent[msg.thread_ts].push(threadMessage);
+        seenReplyTs[threadMessage.ts] = true;
+      });
+    }
+  });
+
+  newParentMessages.sort(function (a, b) {
+    var aTs = parseFloat(a.ts || '0');
+    var bTs = parseFloat(b.ts || '0');
+    return aTs - bTs;
+  });
+
+  for (var parentTs in repliesByParent) {
+    repliesByParent[parentTs].sort(function (a, b) {
+      var aTs = parseFloat(a.ts || '0');
+      var bTs = parseFloat(b.ts || '0');
+      return aTs - bTs;
+    });
+  }
+
+  return {
+    parentMessages: newParentMessages,
+    threadReplies: repliesByParent
+  };
+}
+
 // Slack テキスト整形
 function UnescapeMessageText(text, memberList) {
   return (text || '')
@@ -70,10 +147,8 @@ function UnescapeMessageText(text, memberList) {
     var name = memberList[userID];
     return name ? "@" + name : $0;
   });
-};  
-        
+};
 
-  
 // Slack へのアクセサ
 var SlackAccessor = (function() {
   function SlackAccessor(apiToken) {
@@ -165,10 +240,35 @@ var SlackAccessor = (function() {
     // 最新レコードを一番下にする
     return messages.reverse();
   };
+
+  p.requestThreadMessages = function (channel, threadTs) {
+    var messages = [];
+    var cursor = null;
+    var page = 0;
+
+    do {
+      var params = {
+        channel: channel.id,
+        ts: threadTs,
+        limit: HISTORY_COUNT_PER_PAGE
+      };
+      if (cursor) {
+        params.cursor = cursor;
+      }
+      var response = this.requestAPI('conversations.replies', params);
+      if (response.messages && response.messages.length > 0) {
+        messages = messages.concat(response.messages);
+      }
+      cursor = response.response_metadata && response.response_metadata.next_cursor;
+      page++;
+    } while (cursor && cursor.length > 0 && page <= MAX_HISTORY_PAGINATION);
+
+    console.log("channel(id:" + channel.id + ") thread:" + threadTs + " => loaded replies.");
+    return messages;
+  };
   
   return SlackAccessor;
 })();
-
 
 // スプレッドシートへの操作
 var SpreadsheetController = (function() {
@@ -230,10 +330,26 @@ var SpreadsheetController = (function() {
   p.getLastTimestamp = function (channel) {
     var sheet = this.getChannelSheet(channel);
     var lastRow = sheet.getLastRow();
-    if(lastRow > 0) {
-      return sheet.getRange(lastRow, COL_TIME).getValue();
+    if (lastRow === 0) {
+      return '1';
     }
-    return '1';
+    var range = sheet.getRange(1, COL_TIME, lastRow, 1);
+    var values = range.getValues();
+    var maxTs = 1;
+    for (var i = 0; i < values.length; i++) {
+      var value = values[i][0];
+      if (!value) {
+        continue;
+      }
+      var tsNumber = parseFloat(value);
+      if (isNaN(tsNumber)) {
+        continue;
+      }
+      if (tsNumber > maxTs) {
+        maxTs = tsNumber;
+      }
+    }
+    return maxTs.toString();
   };
   
   // ダウンロードフォルダの確保
@@ -241,79 +357,147 @@ var SpreadsheetController = (function() {
     var sheetName = this.channelToSheetName(channel);
     return FindOrCreateFolder(this.folder, sheetName);
   };
+
+  p.findRowByTimestamp = function (sheet, timestamp) {
+    var lastRow = sheet.getLastRow();
+    if (lastRow === 0) {
+      return null;
+    }
+    var range = sheet.getRange(1, COL_TIME, lastRow, 1);
+    var finder = range.createTextFinder(timestamp).matchEntireCell(true);
+    var cell = finder.findNext();
+    return cell ? cell.getRow() : null;
+  };
+
+  p.collectExistingThreadRows = function (sheet, parentRow) {
+    var lastRow = sheet.getLastRow();
+    if (parentRow >= lastRow) {
+      return [];
+    }
+    var count = lastRow - parentRow;
+    var range = sheet.getRange(parentRow + 1, COL_TEXT, count, 1);
+    var values = range.getValues();
+    var rows = [];
+    for (var i = 0; i < values.length; i++) {
+      var text = values[i][0] || '';
+      if (text.indexOf(THREAD_CHILD_PREFIX) === 0) {
+        rows.push(parentRow + 1 + i);
+      } else {
+        break;
+      }
+    }
+    return rows;
+  };
+
+  p.buildRowData = function (msg, textPrefix, downloadFolder, memberList) {
+    var dateObj = new Date(+msg.ts * 1000);
+    var formattedDate = Utilities.formatDate(dateObj, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    var row = [];
+    row[COL_DATE - 1] = formattedDate;
+    row[COL_USER - 1] = memberList[msg.user] || msg.username || '';
+    var text = UnescapeMessageText(msg.text, memberList);
+    if (textPrefix) {
+      text = textPrefix + (text || '');
+    }
+    row[COL_TEXT - 1] = text;
+
+    var urls = [];
+    var alternateLinks = [];
+    var files = [];
+    if (msg.files && msg.files.length > 0) {
+      files = msg.files;
+    } else if (msg.file) {
+      files = [msg.file];
+    }
+
+    files.forEach(function (fileInfo, index) {
+      var downloadUrl = fileInfo.url_private_download || fileInfo.url_private;
+      if (!downloadUrl) {
+        urls.push('');
+        alternateLinks.push('(This file was deleted.)');
+        return;
+      }
+
+      urls.push(downloadUrl);
+      var file = DownloadData(downloadUrl, downloadFolder, formattedDate + '_' + (index + 1));
+      var driveFile = Drive.Files.get(file.getId());
+      alternateLinks.push(driveFile.alternateLink);
+    });
+
+    if (urls.length === 0) {
+      row[COL_URL - 1] = '';
+      row[COL_LINK - 1] = '';
+    } else {
+      row[COL_URL - 1] = urls.join('\n');
+      row[COL_LINK - 1] = alternateLinks.join('\n');
+    }
+
+    row[COL_TIME - 1] = msg.ts;
+    row[COL_JSON - 1] = JSON.stringify(msg);
+
+    return row;
+  };
+
+  p.insertThreadReplies = function (sheet, parentRow, replies, downloadFolder, memberList) {
+    if (!replies || replies.length === 0) {
+      return;
+    }
+
+    var existingThreadRows = this.collectExistingThreadRows(sheet, parentRow);
+    var insertAfterRow = parentRow;
+
+    if (existingThreadRows.length > 0) {
+      insertAfterRow = existingThreadRows[existingThreadRows.length - 1];
+    }
+
+    var _this = this;
+    replies.forEach(function (reply) {
+      var rowData = _this.buildRowData(reply, THREAD_CHILD_PREFIX, downloadFolder, memberList);
+      sheet.insertRowsAfter(insertAfterRow, 1);
+      var range = sheet.getRange(insertAfterRow + 1, 1, 1, COL_MAX);
+      range.setNumberFormat('@');
+      range.setValues([rowData]);
+      insertAfterRow = insertAfterRow + 1;
+    });
+  };
   
   // 取得したチャンネルのメッセージを保存する
-  p.saveChannelHistory = function (channel, messages, memberList) {
+  p.saveChannelHistory = function (channel, messageBundle, memberList) {
     console.log("saveChannelHistory: " + this.channelToSheetName(channel));
-    var _this = this;
-    
-    var sheet = this.getChannelSheet(channel);    
-    var lastRow = sheet.getLastRow();
-    var currentRow = lastRow + 1;
-    
-    // チャンネルごとにダウンロードフォルダを用意する
+    var sheet = this.getChannelSheet(channel);
+    var parentMessages = (messageBundle && messageBundle.parentMessages) ? messageBundle.parentMessages : [];
+    var threadReplies = (messageBundle && messageBundle.threadReplies) ? messageBundle.threadReplies : {};
+
     var downloadFolder = this.getDownloadFolder(channel);
-    
-    var record = [];
-    // メッセージ内容ごとに整形してスプレッドシートに書き込み
-    messages.forEach(function (msg) {
-      var date = new Date(+msg.ts * 1000);
-      console.log("message: " + date);
-      
-      var row = [];
-      
-      // 日付
-      var date = Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
-      row[COL_DATE - 1] = date;
-      // ユーザー名
-      row[COL_USER - 1] = memberList[msg.user] || msg.username;
-      // Slack テキスト整形
-      row[COL_TEXT - 1] = UnescapeMessageText(msg.text, memberList);
-      // アップロードファイル URL とダウンロード先 Drive の Viewer リンク
-      var urls = [];
-      var alternateLinks = [];
-      var files = [];
-      if (msg.files && msg.files.length > 0) {
-        files = msg.files;
-      } else if (msg.file) {
-        files = [msg.file];
-      }
+    var lastRow = sheet.getLastRow();
 
-      files.forEach(function (fileInfo, index) {
-        var downloadUrl = fileInfo.url_private_download || fileInfo.url_private;
-        if (!downloadUrl) {
-          urls.push("");
-          alternateLinks.push("(This file was deleted.)");
-          return;
-        }
-
-        urls.push(downloadUrl);
-        var file = DownloadData(downloadUrl, downloadFolder, date + "_" + (index + 1));
-        var driveFile = Drive.Files.get(file.getId());
-        alternateLinks.push(driveFile.alternateLink);
+    if (parentMessages.length > 0) {
+      var _this = this;
+      var parentRows = [];
+      parentMessages.forEach(function (msg) {
+        parentRows.push(_this.buildRowData(msg, '', downloadFolder, memberList));
       });
 
-      if (urls.length === 0) {
-        row[COL_URL - 1] = "";
-        row[COL_LINK - 1] = "";
-      } else {
-        row[COL_URL - 1] = urls.join("\n");
-        row[COL_LINK - 1] = alternateLinks.join("\n");
+      var range = sheet.insertRowsAfter(lastRow || 1, parentRows.length)
+                    .getRange(lastRow + 1, 1, parentRows.length, COL_MAX);
+      range.setNumberFormat('@');
+      range.setValues(parentRows);
+    }
+
+    for (var parentTs in threadReplies) {
+      if (!threadReplies.hasOwnProperty(parentTs)) {
+        continue;
       }
-      row[COL_TIME - 1] = msg.ts;
-      // メッセージの JSON 形式
-      row[COL_JSON - 1] = JSON.stringify(msg);
-      
-      record.push(row);
-    });
-    
-    if (record.length > 0)
-    {
-      var range = sheet.insertRowsAfter(lastRow || 1, record.length)
-                    .getRange(lastRow + 1, 1, record.length, COL_MAX);
-      // 全てのデータを文字列型で記録する (タイムスタンプが自動的に数値として扱われてしまうことを防ぐため)
-      range.setNumberFormat("@");
-      range.setValues(record);
+      var replies = threadReplies[parentTs];
+      if (!replies || replies.length === 0) {
+        continue;
+      }
+      var parentRow = this.findRowByTimestamp(sheet, parentTs);
+      if (!parentRow) {
+        console.log('Parent message not found for thread ' + parentTs + ' in channel ' + channel.id);
+        continue;
+      }
+      this.insertThreadReplies(sheet, parentRow, replies, downloadFolder, memberList);
     }
     
   };
@@ -337,9 +521,16 @@ function Run()
   // チャンネルごとにメッセージ内容を取得 
   channelInfo.forEach(function (ch) {
     var timestamp = ssCtrl.getLastTimestamp(ch);
-    var messages = slack.requestMessages(ch, timestamp);
-    
+    var lastTimestampNumber = parseFloat(timestamp);
+    if (isNaN(lastTimestampNumber) || lastTimestampNumber < 1) {
+      lastTimestampNumber = 1;
+    }
+    var threadSearchOldest = Math.floor((new Date().getTime() - THREAD_SEARCH_DAYS * 24 * 60 * 60 * 1000) / 1000);
+    var historyOldest = Math.min(lastTimestampNumber, threadSearchOldest);
+    var messages = slack.requestMessages(ch, historyOldest.toString());
+    var messageBundle = CollectMessagesWithThreads(slack, ch, messages, timestamp);
+
     // ファイル保存
-    ssCtrl.saveChannelHistory(ch, messages, memberList);
+    ssCtrl.saveChannelHistory(ch, messageBundle, memberList);
   });
 }
